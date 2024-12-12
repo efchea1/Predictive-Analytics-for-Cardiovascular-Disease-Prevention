@@ -1,0 +1,353 @@
+# Load needed libraries
+library(dplyr)
+library(knitr)
+library(tidyverse)
+library(ranger)
+library(pROC)
+library(caret)
+library(rpart)
+library(randomForest)
+library(glmnet)
+library(Metrics)
+library(tidymodels)
+library(yardstick)
+library(readr)
+library(rpart.plot) 
+library(partykit) 
+library(kknn)
+library(scales)
+library(broom)
+library(doParallel)
+library(DescTools) # For Brier Score calculation
+library(gridExtra) # To display plots together
+library(ggplot2)
+library(gtsummary)
+
+###########################################################################
+
+# Load the Cardiovascular Diseases Risk Prediction 2021 Dataset
+cardi_data <- read_csv("C:/Users/emman/OneDrive/Desktop/MPH Data Science - UMN/Prediction_ML_PublicHealth/Project/CVD_Data.csv")
+cardi_data <- cardi_data %>%
+  rename(Weight_kg = `Weight_(kg)`, Height_cm = `Height_(cm)`) %>%
+  mutate(across(where(is.character), as.factor))
+
+# View summary
+summary(cardi_data)
+
+#######################################################################
+# Check if the variable Heart Disease is imbalance
+check_imbalance <- function(variable, threshold = 0.2) {
+  proportions <- prop.table(table(variable))
+  if (any(proportions < threshold)) {
+    return("The variable is imbalanced.")
+  } else {
+    return("The variable is not imbalanced.")
+  }
+}
+
+# Check for imbalance
+check_imbalance(cardi_data$Heart_Disease)
+
+#####################################################################
+
+# EDA table
+t2 <- cardi_data %>%
+  tbl_summary(
+    by = Heart_Disease,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "ifany"  # Use "ifany", "no", or "always"
+  ) %>%
+  modify_header(label = "**Variable**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Heart Disease**") %>%
+  add_n() %>%
+  bold_labels() %>%
+  as_gt() %>%
+  gt::tab_header(
+    title = "Baseline Characteristics",
+    subtitle = "Cardiovascular Diseases Risk Prediction Data from the BRFSS 2021 Dataset"
+  ) %>%
+  gt::tab_options(
+    heading.title.font.size = px(16),
+    heading.subtitle.font.size = px(12)
+  )
+
+# print table
+print(t2)
+
+################################################################
+
+# Ensure test_data$Heart_Disease is a factor with correct levels
+cardi_data$Heart_Disease <- factor(cardi_data$Heart_Disease, levels = c("No", "Yes"))
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Split the data into 75/25 for training and testing sets 
+data_split <- initial_split(cardi_data, prop = 0.75)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Data processing
+
+# Convert Categorical Variables to Factors
+categorical_vars <- c("General_Health", "Checkup", "Exercise", "Heart_Disease",
+                      "Depression", "Diabetes", "Arthritis", "Sex", "Age_Category", "Smoking_History", "Skin_Cancer", "Other_Cancer")
+
+for (var in categorical_vars) {
+  train_data[[var]] <- factor(train_data[[var]])
+  test_data[[var]] <- factor(test_data[[var]], levels = levels(train_data[[var]]))
+}
+
+# Scaling Numeric Variables
+numeric_vars <- c("Height_cm", "Weight_kg", "BMI", "Alcohol_Consumption", "Fruit_Consumption", 
+                  "Green_Vegetables_Consumption", "FriedPotato_Consumption")
+
+train_data[numeric_vars] <- scale(train_data[numeric_vars])
+test_data[numeric_vars] <- scale(test_data[numeric_vars])
+
+# Handle Missing Values
+# Example of simple imputation (mean for numeric, mode for categorical)
+for (var in numeric_vars) {
+  train_data[[var]][is.na(train_data[[var]])] <- mean(train_data[[var]], na.rm = TRUE)
+  test_data[[var]][is.na(test_data[[var]])] <- mean(train_data[[var]], na.rm = TRUE)  # Use train mean for test
+}
+
+for (var in categorical_vars) {
+  mode_value <- names(which.max(table(train_data[[var]])))
+  train_data[[var]][is.na(train_data[[var]])] <- mode_value
+  test_data[[var]][is.na(test_data[[var]])] <- mode_value
+}
+
+######################################################################
+
+# Models Building
+
+# Logistic Resgression
+# Define the logistic regression model specification using tidymodels
+logistic_spec <- logistic_reg() %>% 
+  set_engine("glm", family = "binomial") %>% 
+  set_mode("classification")
+
+# Fit Logistic Regression
+logistic_fit <- logistic_spec %>%
+  fit(Heart_Disease ~ ., data = train_data)
+
+# Predictions for Logistic Regression
+logistic_preds <- predict(logistic_fit, test_data, type = "prob")
+
+# Extract probabilities of the positive class
+logistic_probs <- logistic_preds$.pred_Yes
+
+# Calculate ROC for Logistic Regression Model
+roc_logistic <- roc(response = test_data$Heart_Disease, predictor = logistic_probs)
+
+# Print the ROC object to confirm its contents
+print(roc_logistic)
+
+# The ROC object contains the AUC, so you can directly use it
+auc_logistic <- roc_logistic$auc
+
+# Print the AUC
+print(paste("AUC for Logistic Regression: ", auc_logistic))
+
+# Decision Tree
+# Define the decision tree model specification using tidymodels
+tree_spec <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+tree_fit <- tree_spec %>%
+  fit(Heart_Disease ~ ., data = train_data)
+
+# Make predictions on the test set and obtain predicted probabilities
+tree_preds <- predict(tree_fit, test_data, type = "prob")
+
+# Extract probabilities of the positive class (assuming "Yes" is the positive class)
+tree_positive_probs <- tree_preds$.pred_Yes  # Ensure that 'Yes' is the correct level for the positive class
+
+# Calculate ROC for Decision Tree Model
+roc_tree <- roc(response = test_data$Heart_Disease, predictor = tree_positive_probs)
+
+# Print ROC object to verify it's correct
+print(roc_tree)
+
+# Directly calculate AUC from the ROC object
+auc_tree <- roc_tree$auc  # Direct access to the AUC from the ROC object
+
+# Print the AUC
+print(paste("AUC for Decision Tree: ", auc_tree))
+
+# K-Nearest Neighbors (KNN)
+# Sample 1,000 observations from the test set
+test_data_subset <- test_data %>% sample_n(1000)
+
+# Fit the KNN model with probability output enabled
+knn_fit <- kknn(Heart_Disease ~ ., train_data, test_data_subset, k = 5, distance = 2, kernel = "optimal")
+
+# Extract predicted probabilities from the fitted KNN model
+knn_probs <- knn_fit$prob[, 2]  # Ensure that this is indeed the probability for "Yes"
+
+# Ensure knn_probs is numeric
+if (is.null(knn_probs)) {
+  stop("knn_probs returned NULL. Check the kknn model output.")
+} else {
+  knn_positive_probs <- as.numeric(knn_probs)
+}
+
+# Calculate ROC and AUC for the subset
+if (exists("knn_positive_probs") && !is.null(knn_positive_probs)) {
+  roc_knn <- roc(response = test_data_subset$Heart_Disease, predictor = knn_positive_probs)
+  auc_knn <- roc_knn$auc # Directly use the ROC object
+  print(paste("AUC for KNN (on subset): ", auc_knn))
+} else {
+  stop("knn_positive_probs was not found or created. Please check the format of knn_probs.")
+}
+
+# Random Forest
+# Fit Random Forest using ranger
+rf_model <- ranger(
+  formula = Heart_Disease ~ ., 
+  data = train_data, 
+  probability = TRUE,  # Enable probability prediction for AUC calculation
+  num.trees = 200,     # Number of trees (can be adjusted based on performance and computational capacity)
+  mtry = floor(sqrt(ncol(train_data))),  # Default mtry is sqrt of total number of variables
+  min.node.size = 10   # Minimum node size (can be tuned for better results)
+)
+
+# Predict using the random forest model
+rf_predictions <- predict(rf_model, data = test_data, type = "response")
+
+# Extract probabilities of the positive class
+rf_probs <- rf_predictions$predictions[, "Yes"]  # Ensure that "Yes" corresponds to the positive class
+
+# Calculate ROC and AUC using pROC
+rf_roc <- roc(response = test_data$Heart_Disease, predictor = rf_probs)
+
+# Directly calculate AUC from the ROC object
+rf_auc <- rf_roc$auc  
+
+# Print the AUC
+print(paste("AUC for Random Forest: ", rf_auc))
+
+# Combined AUC Table
+# Combine AUC results into a table
+auc_summary <- data.frame(
+  Model = c("Logistic Regression Model", "Decision Tree Model", "K-Nearest Neighbors Model", "Random Forest Model"),
+  AUC = c(auc_logistic, auc_tree, auc_knn, rf_auc)
+)
+
+# Display the combined AUC table
+kable(auc_summary,
+      col.names = c("Model", "AUC"))
+
+# Brier scores and Confusion Matrices for the models
+# Convert factor levels 'No' = 0 and 'Yes' = 1
+numeric_heart_disease <- as.numeric(test_data$Heart_Disease) - 1
+
+# Calculate Brier Score for Logistic Regression
+logistic_brier <- BrierScore(numeric_heart_disease, logistic_probs)
+print(logistic_brier)
+
+# Calculate Confusion Matrix for Logistic Regression
+logistic_predictions <- ifelse(logistic_probs > 0.5, 1, 0)
+logistic_cm <- table(Predicted = logistic_predictions, Actual = numeric_heart_disease)
+print(logistic_cm)
+
+# Calculate Brier Score for Decision Tree
+tree_brier <- BrierScore(numeric_heart_disease, tree_positive_probs)
+print(tree_brier)
+
+# Calculate Confusion Matrix for Decision Tree
+tree_predictions <- ifelse(tree_positive_probs > 0.5, 1, 0)
+tree_cm <- table(Predicted = tree_predictions, Actual = numeric_heart_disease)
+print(tree_cm)
+
+# Calculate Brier Score for K-Nearest Neighbors (KNN)
+# Note: Ensure you have the correct subset matching `knn_positive_probs`
+numeric_heart_disease_subset <- as.numeric(test_data_subset$Heart_Disease) - 1
+knn_brier <- BrierScore(numeric_heart_disease_subset, knn_positive_probs)
+print(knn_brier)
+
+# Calculate Confusion Matrix for KNN
+knn_predictions <- ifelse(knn_positive_probs > 0.5, 1, 0)
+knn_cm <- table(Predicted = knn_predictions, Actual = numeric_heart_disease_subset)
+print(knn_cm)
+
+# Calculate Brier Score for Random Forest
+rf_brier <- BrierScore(numeric_heart_disease, rf_probs)
+print(rf_brier)
+
+# Calculate Confusion Matrix for Random Forest
+rf_predictions <- ifelse(rf_probs > 0.5, 1, 0)
+rf_cm <- table(Predicted = rf_predictions, Actual = numeric_heart_disease)
+print(rf_cm)
+
+# Display all Brier scores in a summary table
+brier_summary <- data.frame(
+  Model = c("Logistic Regression", "Decision Tree", "K-Nearest Neighbors", "Random Forest"),
+  Brier_Score = c(logistic_brier, tree_brier, knn_brier, rf_brier)
+)
+
+# Print the summary table
+kable(brier_summary,
+      col.names = c("Model", "Brier Score"))
+
+# Create a summary of confusion matrices
+confusion_matrices <- list(
+  Logistic_Regression = logistic_cm,
+  Decision_Tree = tree_cm,
+  KNN = knn_cm,
+  Random_Forest = rf_cm
+)
+
+# Print confusion matrices
+print(confusion_matrices)
+
+# Calibration table and plots
+# Helper function to create calibration data
+func_calibration_data <- function(predictions, observed) {
+  data.frame(Predicted = predictions, Actual = as.numeric(observed) - 1) %>%
+    mutate(Bin = cut(Predicted, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE, right = FALSE)) %>%
+    group_by(Bin) %>%
+    summarise(
+      Mean_Predicted = mean(Predicted),
+      Observed_Rate = mean(Actual),
+      .groups = 'drop'
+    )
+}
+
+# Create calibration data for each model
+calibration_logistic <- func_calibration_data(logistic_probs, test_data$Heart_Disease)
+calibration_tree <- func_calibration_data(tree_positive_probs, test_data$Heart_Disease)
+calibration_knn <- func_calibration_data(knn_positive_probs, test_data_subset$Heart_Disease) # Note the subset used for KNN
+calibration_rf <- func_calibration_data(rf_probs, test_data$Heart_Disease)
+
+# Plot calibration curves
+plot_calibration <- function(calibration_data, model_name) {
+  ggplot(calibration_data, aes(x = Mean_Predicted, y = Observed_Rate)) +
+    geom_line() +
+    geom_point(size = 2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    ggtitle(paste("Calibration Plot for", model_name)) +
+    xlab("Mean Predicted Probability") +
+    ylab("Observed Rate") +
+    theme_minimal()
+}
+
+# Generate plots for each model
+p1 <- plot_calibration(calibration_logistic, "Logistic Regression")
+p2 <- plot_calibration(calibration_tree, "Decision Tree")
+p3 <- plot_calibration(calibration_knn, "KNN")
+p4 <- plot_calibration(calibration_rf, "Random Forest")
+
+# Print calibration tables
+print(calibration_logistic)
+print(calibration_tree)
+print(calibration_knn)
+print(calibration_rf)
+
+# Display all plots together if you prefer
+grid.arrange(p1, p2, p3, p4, ncol = 2)
